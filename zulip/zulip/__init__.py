@@ -10,8 +10,7 @@ import time
 import traceback
 import types
 import urllib.parse
-from configparser import SafeConfigParser
-from distutils.version import LooseVersion
+from configparser import ConfigParser
 from typing import (
     IO,
     Any,
@@ -28,21 +27,51 @@ from typing import (
 
 import distro
 import requests
+from typing_extensions import Literal
 
-__version__ = "0.8.1"
+__version__ = "0.8.2"
 
 # Ensure the Python version is supported
 assert sys.version_info >= (3, 6)
 
 logger = logging.getLogger(__name__)
 
-# Check that we have a recent enough version
-# Older versions don't provide the 'json' attribute on responses.
-assert LooseVersion(requests.__version__) >= LooseVersion("0.12.1")
 # In newer versions, the 'json' attribute is a function, not a property
 requests_json_is_function = callable(requests.Response.json)
 
 API_VERSTRING = "v1/"
+
+# An optional parameter to `move_topic` and `update_message` actions
+# See eg. https://zulip.com/api/update-message#parameter-propagate_mode
+EditPropagateMode = Literal["change_one", "change_all", "change_later"]
+
+# Generally a `reaction_type` is present whenever an emoji is specified:
+# - Optional parameters to actions: `add_reaction`, `remove_reaction`
+# - Events: "user_status", "reaction", "message", "update_message"
+# - Inside each reaction in the `reactions` field of returned message objects.
+EmojiType = Literal["realm_emoji", "unicode_emoji", "zulip_extra_emoji"]
+
+# Message flags which may be directly modified by the current user:
+# - Updated by `update_message_flags` (and for the `read` flag, also
+#   the `mark_all_as_read`, `mark_stream_as_read`, and
+#   `mark_topic_as_read` actions).
+# - User is notified of changes via `update_message_flags` events.
+# See subset of https://zulip.com/api/update-message-flags#available-flags
+ModifiableMessageFlag = Literal["read", "starred", "collapsed"]
+
+# All possible message flags.
+# - Generally present in `flags` object of returned message objects.
+# - User is notified of changes via "update_message_flags" and `update_message`
+#   events. The latter is important for clients to learn when a message is
+#   edited to mention the current user or contain an alert word.
+# See https://zulip.com/api/update-message-flags#available-flags
+MessageFlag = Literal[
+    ModifiableMessageFlag,
+    "mentioned",
+    "wildcard_mentioned",
+    "has_alert_word",
+    "historical",
+]
 
 
 class CountingBackoff:
@@ -119,7 +148,6 @@ def add_default_arguments(
     patch_error_handling: bool = True,
     allow_provisioning: bool = False,
 ) -> argparse.ArgumentParser:
-
     if patch_error_handling:
 
         def custom_error_handling(self: argparse.ArgumentParser, message: str) -> None:
@@ -257,7 +285,6 @@ def generate_option_group(parser: optparse.OptionParser, prefix: str = "") -> op
 
 
 def init_from_options(options: Any, client: Optional[str] = None) -> "Client":
-
     if getattr(options, "provision", False):
         requirements_path = os.path.abspath(os.path.join(sys.path[0], "requirements.txt"))
         try:
@@ -396,9 +423,9 @@ class Client:
             config_file = get_default_config_filename()
 
         if config_file is not None and os.path.exists(config_file):
-            config = SafeConfigParser()
+            config = ConfigParser()
             with open(config_file) as f:
-                config.readfp(f, config_file)
+                config.read_file(f, config_file)
             if api_key is None:
                 api_key = config.get("api", "key")
             if email is None:
@@ -492,7 +519,6 @@ class Client:
         assert self.zulip_version is not None
 
     def ensure_session(self) -> None:
-
         # Check if the session has been created already, and return
         # immediately if so.
         if self.session:
@@ -564,7 +590,7 @@ class Client:
         request = {}
         req_files = []
 
-        for (key, val) in orig_request.items():
+        for key, val in orig_request.items():
             if isinstance(val, str) or isinstance(val, str):
                 request[key] = val
             else:
@@ -652,10 +678,7 @@ class Client:
                     continue
                 else:
                     end_error_retry(False)
-                    return {
-                        "msg": f"Connection error:\n{traceback.format_exc()}",
-                        "result": "connection-error",
-                    }
+                    raise
             except requests.exceptions.ConnectionError:
                 if not self.has_connected:
                     # If we have never successfully connected to the server, don't
@@ -667,16 +690,10 @@ class Client:
                 if error_retry(""):
                     continue
                 end_error_retry(False)
-                return {
-                    "msg": f"Connection error:\n{traceback.format_exc()}",
-                    "result": "connection-error",
-                }
+                raise
             except Exception:
                 # We'll split this out into more cases as we encounter new bugs.
-                return {
-                    "msg": f"Unexpected error:\n{traceback.format_exc()}",
-                    "result": "unexpected-error",
-                }
+                raise
 
             try:
                 if requests_json_is_function:
@@ -708,7 +725,7 @@ class Client:
         if request is None:
             request = dict()
         marshalled_request = {}
-        for (k, v) in request.items():
+        for k, v in request.items():
             if v is not None:
                 marshalled_request[k] = v
         versioned_url = API_VERSTRING + (url if url is not None else "")
@@ -732,7 +749,6 @@ class Client:
             narrow = []
 
         def do_register() -> Tuple[str, int]:
-
             while True:
                 if event_types is None:
                     res = self.register(None, None, **kwargs)
@@ -753,16 +769,28 @@ class Client:
             if queue_id is None:
                 (queue_id, last_event_id) = do_register()
 
-            res = self.get_events(queue_id=queue_id, last_event_id=last_event_id)
+            try:
+                res = self.get_events(queue_id=queue_id, last_event_id=last_event_id)
+            except (
+                requests.exceptions.Timeout,
+                requests.exceptions.SSLError,
+                requests.exceptions.ConnectionError,
+            ):
+                if self.verbose:
+                    print(f"Connection error fetching events:\n{traceback.format_exc()}")
+                # TODO: Make this use our backoff library
+                time.sleep(1)
+                continue
+            except Exception:
+                print(f"Unexpected error:\n{traceback.format_exc()}")
+                # TODO: Make this use our backoff library
+                time.sleep(1)
+                continue
+
             if "error" in res["result"]:
                 if res["result"] == "http-error":
                     if self.verbose:
                         print("HTTP error fetching events -- probably a server restart")
-                elif res["result"] == "connection-error":
-                    if self.verbose:
-                        print(
-                            "Connection error fetching events -- probably server is temporarily down?"
-                        )
                 else:
                     if self.verbose:
                         print("Server returned error:\n{}".format(res["msg"]))
@@ -791,6 +819,15 @@ class Client:
 
             for event in res["events"]:
                 last_event_id = max(last_event_id, int(event["id"]))
+
+                if event["type"] == "heartbeat":
+                    # Heartbeat events are sent to clients regardless
+                    # of the client's requested event types, and are
+                    # intended to be an internal part of the Zulip
+                    # longpolling protocol, not something that clients
+                    # need to handle.
+                    continue
+
                 callback(event)
 
     def call_on_each_message(
@@ -809,7 +846,6 @@ class Client:
         return self.call_endpoint(url="messages", method="GET", request=message_filters)
 
     def check_messages_match_narrow(self, **request: Dict[str, Any]) -> Dict[str, Any]:
-
         """
         Example usage:
 
@@ -1246,7 +1282,6 @@ class Client:
         )
 
     def add_default_stream(self, stream_id: int) -> Dict[str, Any]:
-
         """
         Example usage:
 
@@ -1260,7 +1295,6 @@ class Client:
         )
 
     def get_user_by_id(self, user_id: int, **request: Any) -> Dict[str, Any]:
-
         """
         Example usage:
 
@@ -1274,7 +1308,6 @@ class Client:
         )
 
     def deactivate_user_by_id(self, user_id: int) -> Dict[str, Any]:
-
         """
         Example usage:
 
@@ -1287,7 +1320,6 @@ class Client:
         )
 
     def reactivate_user_by_id(self, user_id: int) -> Dict[str, Any]:
-
         """
         Example usage:
 
@@ -1300,7 +1332,6 @@ class Client:
         )
 
     def update_user_by_id(self, user_id: int, **request: Any) -> Dict[str, Any]:
-
         """
         Example usage:
 
@@ -1383,12 +1414,16 @@ class Client:
         )
 
     def remove_subscriptions(
-        self, streams: Iterable[str], principals: Union[Sequence[str], Sequence[int]] = []
+        self,
+        streams: Iterable[str],
+        principals: Optional[Union[Sequence[str], Sequence[int]]] = None,
     ) -> Dict[str, Any]:
         """
         See examples/unsubscribe for example usage.
         """
-        request = dict(subscriptions=streams, principals=principals)
+        request: Dict[str, object] = dict(subscriptions=streams)
+        if principals is not None:
+            request["principals"] = principals
         return self.call_endpoint(
             url="users/me/subscriptions",
             method="DELETE",
@@ -1634,7 +1669,7 @@ class Client:
         topic: str,
         new_topic: Optional[str] = None,
         message_id: Optional[int] = None,
-        propagate_mode: str = "change_all",
+        propagate_mode: EditPropagateMode = "change_all",
         notify_old_topic: bool = True,
         notify_new_topic: bool = True,
     ) -> Dict[str, Any]:
